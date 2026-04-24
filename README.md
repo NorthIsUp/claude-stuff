@@ -6,9 +6,9 @@ Personal Claude Code odds and ends — statusline, helper scripts, hooks.
 
 | Tool | What it does |
 |------|---------|
-| [`cc-statusline`](bin/cc-statusline) | Single-line Claude Code statusline. Branch + PR + CI + review + comments + Linear ticket on the left; context bar, quota, model, effort on the right. Shows `org/repo` (and worktree name) ahead of branch info, falls back to pwd outside a repo. Reads session JSON on stdin; caches `gh` / `linear` lookups per session. |
-| [`cc-thread-prs`](bin/cc-thread-prs) | Lists PRs created by a given Claude Code session by scanning the transcript for `gh pr create`, MCP github creates, and `api.github.com` POSTs. Used by the statusline to render the "other PRs this session" chip. |
-| [`claude-allow`](bin/claude-allow) | One-liner to add a tool permission to `~/.claude/settings.json`. `claude-allow cmd "git push"` → adds `Bash(git push:*)`. |
+| [`cc-statusline`](plugins/northisup-utils/bin/cc-statusline) | Single-line Claude Code statusline. Branch + PR + CI + review + comments + Linear ticket on the left; context bar, quota, model, effort on the right. Shows `org/repo` (and worktree name) ahead of branch info, falls back to pwd outside a repo. Reads session JSON on stdin; caches `gh` / `linear` lookups per session. |
+| [`cc-thread-prs`](plugins/northisup-utils/bin/cc-thread-prs) | Lists PRs created by a given Claude Code session by scanning the transcript for `gh pr create`, MCP github creates, and `api.github.com` POSTs. Used by the statusline to render the "other PRs this session" chip. |
+| [`claude-allow`](plugins/northisup-utils/bin/claude-allow) | One-liner to add a tool permission to `~/.claude/settings.json`. `claude-allow cmd "git push"` → adds `Bash(git push:*)`. |
 
 ## Install
 
@@ -16,7 +16,7 @@ Personal Claude Code odds and ends — statusline, helper scripts, hooks.
 
 ```
 /plugin marketplace add NorthIsUp/claude-stuff
-/plugin install claude-stuff@claude-stuff
+/plugin install northisup-utils@claude-stuff
 ```
 
 ### Or in a single project

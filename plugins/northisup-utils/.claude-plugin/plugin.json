@@ -1,0 +1,10 @@
+{
+  "name": "northisup-utils",
+  "version": "0.1.0",
+  "description": "NorthIsUp's Utils — statusline + helpers for Claude Code: org/repo + branch + PR/CI/review state on the left, context bar / quota / model on the right.",
+  "author": {
+    "name": "NorthIsUp",
+    "email": "adam@askclara.com"
+  },
+  "homepage": "https://github.com/NorthIsUp/claude-stuff"
+}
