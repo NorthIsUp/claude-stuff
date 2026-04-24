@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# cc-thread-prs — list PRs created by the current (or given) Claude Code session.
+#
+# Source of truth: the session transcript only. No sidecar logs, no gh pr list
+# fallback. If the creation wasn't captured in the transcript, it doesn't count.
+#
+# Usage:
+#   cc-thread-prs                      # most recent transcript for $PWD
+#   cc-thread-prs --transcript <path>  # explicit transcript file
+#   cc-thread-prs --session <id>       # session id (.jsonl under ~/.claude/projects)
+#   cc-thread-prs --all                # also list referenced-but-not-created PRs
+#   cc-thread-prs --urls-only          # print URLs only, skip gh hydration
+#
+# Creation signals it looks for, across tool_use / tool_result pairs:
+#   1. Bash   `gh pr create ...`
+#   2. MCP    any tool_use whose name matches /github.*(create.*pull|pull.*create|
+#             create.*pr|open.*pr)/i
+#   3. HTTP   Bash curl or WebFetch to POST https://api.github.com/.../pulls
+#
+# Referenced-only (--all mode): every github.com/.../pull/N URL in the transcript
+# that wasn't captured as a creation.
+
+set -euo pipefail
+
+MODE="created"
+URLS_ONLY=0
+TRANSCRIPT=""
+SESSION=""
+
+while (($#)); do
+  case "$1" in
+    --transcript) TRANSCRIPT=$2; shift 2 ;;
+    --session)    SESSION=$2;    shift 2 ;;
+    --all)        MODE="all";    shift ;;
+    --urls-only)  URLS_ONLY=1;   shift ;;
+    -h|--help)    sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "cc-thread-prs: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── Resolve transcript ──────────────────────────────────────────────────────
+if [[ -z "$TRANSCRIPT" ]]; then
+  if [[ -n "$SESSION" ]]; then
+    TRANSCRIPT=$(ls -t "$HOME"/.claude/projects/*/"$SESSION".jsonl 2>/dev/null | head -1)
+  else
+    # Encode cwd the way Claude Code does: / _ . → -
+    encoded=${PWD//[\/_.]/-}
+    TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$encoded"/*.jsonl 2>/dev/null | head -1)
+  fi
+fi
+
+if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
+  echo "cc-thread-prs: no transcript found for ${SESSION:-$PWD}" >&2
+  exit 1
+fi
+
+echo "# transcript: $TRANSCRIPT" >&2
+
+# ── Extract creation tool_use IDs ───────────────────────────────────────────
+creation_ids=$(jq -rc '
+  select(.message.content)
+  | .message.content
+  | if type=="array" then .[] else . end
+  | select(type=="object" and .type=="tool_use")
+  | select(
+      (.name == "Bash"     and (.input.command // "" | test("\\bgh pr create\\b")))
+      or (.name | test("(?i)github.*(create.*pull|pull.*create|create.*pr\\b|open.*pr\\b)"))
+      or (.name == "Bash"     and (.input.command // "" | test("api\\.github\\.com/repos/[^/]+/[^/]+/pulls")))
+      or (.name == "WebFetch" and (.input.url     // "" | test("api\\.github\\.com/repos/[^/]+/[^/]+/pulls")))
+    )
+  | .id
+' "$TRANSCRIPT" | sort -u)
+
+# ── Pair IDs with their tool_result content and extract PR URLs ─────────────
+created_urls=""
+if [[ -n "$creation_ids" ]]; then
+  # Build a jq filter that only keeps tool_results whose tool_use_id is in our set
+  id_array=$(jq -Rsc 'split("\n") | map(select(length>0))' <<<"$creation_ids")
+  created_urls=$(jq -rc --argjson ids "$id_array" '
+    select(.message.content)
+    | .message.content
+    | if type=="array" then .[] else . end
+    | select(type=="object" and .type=="tool_result")
+    | select(.tool_use_id as $t | $ids | index($t))
+    | .content
+    | if type=="string" then .
+      elif type=="array" then (map(.text // "") | join(" "))
+      else tostring end
+  ' "$TRANSCRIPT" \
+    | grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+' \
+    | sort -u)
+fi
+
+all_urls=$(grep -hoE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+' "$TRANSCRIPT" | sort -u)
+
+# ── Output ──────────────────────────────────────────────────────────────────
+if (( URLS_ONLY )); then
+  if [[ "$MODE" == "all" ]]; then
+    # Union of created + referenced URLs, deduped, no prefixes — callers
+    # (like the statusline) just want a flat list of PRs this session touched.
+    { [[ -n "$created_urls" ]] && printf '%s\n' "$created_urls"
+      [[ -n "$all_urls"     ]] && printf '%s\n' "$all_urls"; } | sort -u | grep -v '^$' || true
+  else
+    [[ -n "$created_urls" ]] && printf '%s\n' "$created_urls"
+  fi
+  exit 0
+fi
+
+render() {
+  local url=$1 origin=$2
+  local num=${url##*/}
+  local repo=${url#https://github.com/}; repo=${repo%/pull/*}
+  local info
+  info=$(gh pr view "$num" --repo "$repo" --json number,title,state,isDraft,headRefName 2>/dev/null) || {
+    printf '%-8s #%-5s %-7s %-40s %s\n' "$origin" "$num" "???" "" "$url (fetch failed)"
+    return
+  }
+  local state branch title
+  state=$(jq -r 'if .isDraft then "DRAFT" else .state end' <<<"$info")
+  branch=$(jq -r '.headRefName' <<<"$info")
+  title=$(jq -r '.title' <<<"$info")
+  printf '%-8s #%-5s %-7s %-40s %s\n' "$origin" "$num" "$state" "${branch:0:40}" "$title"
+}
+
+printf '%-8s %-6s %-7s %-40s %s\n' "ORIGIN" "PR" "STATE" "BRANCH" "TITLE"
+
+if [[ -z "$created_urls" && "$MODE" != "all" ]]; then
+  echo "(no PR-creation tool calls in transcript)" >&2
+  exit 0
+fi
+
+while IFS= read -r u; do
+  [[ -z "$u" ]] && continue
+  render "$u" "created"
+done <<<"$created_urls"
+
+if [[ "$MODE" == "all" ]]; then
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+    grep -qxF "$u" <<<"$created_urls" || render "$u" "ref"
+  done <<<"$all_urls"
+fi

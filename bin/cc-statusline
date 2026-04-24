@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+# Claude Code statusline.
+#
+# Layout:
+#   Wide  (1 line):  [branch #PR]  CI  review  💬N  [TICKET] (N prs)                bar 47% [Opus]
+#   Narrow (2 lines): [branch #PR]  CI  review  💬N  [TICKET] (N prs)
+#                                                         bar 47% [Opus]
+#
+# Reads session JSON on stdin. Caches gh/linear lookups per session_id.
+
+set -uo pipefail
+
+# ── Input ────────────────────────────────────────────────────────────────────
+input=$(cat)
+MODEL=$(jq -r '.model.display_name // "?"'                           <<<"$input")
+CWD=$(jq -r '.workspace.current_dir // ""'                           <<<"$input")
+SESSION=$(jq -r '.session_id // "nosession"'                         <<<"$input")
+CTX_PCT=$(jq -r '.context_window.used_percentage // 0'               <<<"$input" | cut -d. -f1)
+COST=$(jq -r '.cost.total_cost_usd // 0'                             <<<"$input")
+WT_BRANCH=$(jq -r '.workspace.git_worktree // ""'                    <<<"$input")
+R5H=$(jq -r '.rate_limits.five_hour.used_percentage // empty'        <<<"$input" | cut -d. -f1)
+R7D=$(jq -r '.rate_limits.seven_day.used_percentage // empty'        <<<"$input" | cut -d. -f1)
+R5H_RESET=$(jq -r '.rate_limits.five_hour.resets_at // empty'        <<<"$input")
+R7D_RESET=$(jq -r '.rate_limits.seven_day.resets_at // empty'        <<<"$input")
+TRANSCRIPT=$(jq -r '.transcript_path // ""'                          <<<"$input")
+EFFORT=$(jq -r '.effort_level // .effortLevel // .output_style.effort // empty' <<<"$input")
+if [[ -z "$EFFORT" && -f "$HOME/.claude/settings.json" ]]; then
+  EFFORT=$(jq -r '.effortLevel // empty' "$HOME/.claude/settings.json" 2>/dev/null)
+fi
+FAST_MODE=$(jq -r '.fast_mode // false'                              <<<"$input")
+OUTPUT_STYLE=$(jq -r '.output_style.name // empty'                   <<<"$input")
+DURATION_MS=$(jq -r '.cost.total_duration_ms // 0'                   <<<"$input")
+
+# ── Geometry ─────────────────────────────────────────────────────────────────
+# Claude Code does NOT pipe terminal width in the statusLine JSON and runs the
+# script without a controlling tty, so $COLUMNS is unset and `tput cols` fails.
+# /dev/tty usually still resolves to the host terminal — prefer that.
+COLS=$(jq -r '.terminal.width // .terminal.columns // .window.columns // .cols // empty' <<<"$input" 2>/dev/null)
+[[ -z "$COLS" || ! "$COLS" =~ ^[0-9]+$ ]] && COLS=$({ stty size < /dev/tty | awk '{print $2}'; } 2>/dev/null || true)
+[[ -z "$COLS" || ! "$COLS" =~ ^[0-9]+$ ]] && COLS=$(tput -T "${TERM:-xterm-256color}" cols </dev/tty 2>/dev/null || true)
+[[ -z "$COLS" || ! "$COLS" =~ ^[0-9]+$ ]] && COLS="${COLUMNS:-}"
+[[ -z "$COLS" || ! "$COLS" =~ ^[0-9]+$ ]] && COLS=120
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+# Nerd Font (UTF-8 escapes, bash 3.2 compatible)
+G_PR_OPEN=$'\xef\x90\x87'    G_PR_DRAFT=$'\xee\xae\xa9'
+G_PR_CLOSED=$'\xee\xae\xa8'  G_MERGED=$'\xef\x90\x99'
+G_BRANCH=$'\xef\x90\x98'     G_COMMENT=$'\xef\x90\x9f'
+G_APPROVED=$'\xef\x90\xae'   G_CHANGES=$'\xef\x90\xa1'
+G_CI_PASS=$'\xef\x90\xae'    G_CI_FAIL=$'\xef\x90\xa1'
+G_CI_PEND=$'\xef\x91\xaa'    G_LINEAR=$'\xf3\xb0\xa4\x8b'  # 󰤋 placeholder
+# Environment location glyphs
+G_APPLE=$'\xef\x85\xb9'      # U+F179 apple
+G_CLOUD=$'\xef\x83\x82'      # U+F0C2 cloud
+G_SSH=$'\xef\x92\x89'        # U+F489 terminal
+G_DOCKER=$'\xef\x8c\x88'     # U+F308 docker
+G_CTX=$'\xef\x82\xa0'        # U+F0A0 nf-fa-hdd_o (disk = context storage)
+G_5H=$'\xef\x80\x97'         # U+F017 nf-fa-clock_o (5-hour rolling window)
+G_7D=$'\xef\x81\xb3'         # U+F073 nf-fa-calendar (7-day window)
+G_EFFORT=$'\xef\x83\xa7'     # U+F0E7 nf-fa-bolt (reasoning effort)
+G_AHEAD=$'\xe2\x86\x91'      # ↑
+G_BEHIND=$'\xe2\x86\x93'     # ↓
+G_DIRTY=$'\xc2\xb1'          # ±
+G_DOLLAR=$'\xef\x85\x95'     # U+F155 nf-fa-dollar
+
+DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+FG_GREEN=$'\033[32m'; FG_RED=$'\033[31m'; FG_YELLOW=$'\033[33m'
+FG_CYAN=$'\033[36m'; FG_MAGENTA=$'\033[35m'
+
+link() { # url text -> OSC 8 hyperlink
+  printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$2"
+}
+
+strip() { # strip ANSI + OSC 8 for width calc
+  printf '%s' "$1" | perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g' 2>/dev/null \
+    || printf '%s' "$1" | sed -E $'s/\x1b\\[[0-9;]*m//g'
+}
+
+vlen() { # visible length. Treats Nerd Font PUA glyphs and true emoji as 2 cols.
+  # -CSDA: UTF-8-decode @ARGV too, so multi-byte glyphs become single chars.
+  perl -CSDA -e '
+    my $s = shift;
+    $s =~ s/\e\[[0-9;]*m//g;
+    $s =~ s/\e\]8;;[^\e]*\e\\//g;
+    my $w = 0;
+    for my $c (split //, $s) {
+      my $cp = ord $c;
+      if (($cp >= 0xE000  && $cp <= 0xF8FF)   ||   # BMP Private Use Area (Nerd Fonts)
+          ($cp >= 0xF0000 && $cp <= 0xFFFFD)  ||   # Supplementary PUA-A (Nerd Fonts v3)
+          ($cp >= 0x1F300 && $cp <= 0x1FAFF)  ||   # Emoji (Misc Symbols & Pictographs, etc.)
+          ($cp >= 0x2300  && $cp <= 0x23FF)   ||   # Misc Technical (⏰ and friends)
+          ($cp >= 0x2600  && $cp <= 0x27BF)   ||   # Misc Symbols & Dingbats
+          ($cp >= 0x1100  && $cp <= 0x115F)   ||   # Hangul Jamo
+          ($cp >= 0x2E80  && $cp <= 0x9FFF)   ||   # CJK
+          ($cp >= 0xAC00  && $cp <= 0xD7A3)   ||   # Hangul Syllables
+          ($cp >= 0xF900  && $cp <= 0xFAFF)   ||   # CJK Compat Ideographs
+          ($cp >= 0xFF00  && $cp <= 0xFF60)) {     # Fullwidth Forms
+        $w += 2;
+      } else {
+        $w += 1;
+      }
+    }
+    print $w;
+  ' -- "$1"
+}
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+CACHE_DIR="/tmp/cc-statusline-${SESSION}"
+mkdir -p "$CACHE_DIR"
+PR_CACHE="$CACHE_DIR/pr.json"
+OTHER_PRS_CACHE="$CACHE_DIR/other.txt"
+CACHE_TTL=30
+OTHER_TTL=120
+
+mtime() { # path -> mtime seconds (BSD/macOS: -f, GNU/Linux: -c). Prints 0 on failure.
+  local m
+  m=$(stat -f %m "$1" 2>/dev/null)
+  [[ "$m" =~ ^[0-9]+$ ]] || m=$(stat -c %Y "$1" 2>/dev/null)
+  [[ "$m" =~ ^[0-9]+$ ]] || m=0
+  printf '%s' "$m"
+}
+
+cache_fresh() { # path ttl -> 0 if fresh
+  [[ -f "$1" ]] || return 1
+  local age=$(( $(date +%s) - $(mtime "$1") ))
+  (( age < $2 ))
+}
+
+# ── Git / PR data ────────────────────────────────────────────────────────────
+cd "$CWD" 2>/dev/null
+BRANCH=""
+PR_JSON="{}"
+DIRTY=0
+AHEAD=0
+BEHIND=0
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  BRANCH="${WT_BRANCH:-$(git branch --show-current 2>/dev/null)}"
+  if ! cache_fresh "$PR_CACHE" "$CACHE_TTL"; then
+    gh pr view --json state,isDraft,reviewDecision,comments,statusCheckRollup,url,number 2>/dev/null \
+      > "$PR_CACHE" || echo '{}' > "$PR_CACHE"
+  fi
+  PR_JSON=$(cat "$PR_CACHE")
+  # Dirty count + ahead/behind in a single porcelain call.
+  while IFS= read -r line; do
+    case "$line" in
+      "# branch.ab "*)
+        ab=${line#\# branch.ab }
+        AHEAD=${ab%% *};  AHEAD=${AHEAD#+}
+        BEHIND=${ab##* }; BEHIND=${BEHIND#-}
+        ;;
+      "# "*) : ;;
+      "") : ;;
+      *) DIRTY=$(( DIRTY + 1 )) ;;
+    esac
+  done < <(git status --porcelain=v2 -b 2>/dev/null)
+fi
+
+PR_STATE=$(jq -r   '.state // ""'                 <<<"$PR_JSON")
+PR_DRAFT=$(jq -r   '.isDraft // false'            <<<"$PR_JSON")
+PR_REVIEW=$(jq -r  '.reviewDecision // ""'        <<<"$PR_JSON")
+PR_COMMENTS=$(jq -r '.comments | length // 0'     <<<"$PR_JSON")
+PR_URL=$(jq -r     '.url // ""'                   <<<"$PR_JSON")
+PR_NUM=$(jq -r     '.number // ""'                <<<"$PR_JSON")
+CI=$(jq -r '
+  [.statusCheckRollup[]? | (.conclusion // .status // "")] as $s
+  | if   ($s | any(. == "FAILURE" or . == "FAILED" or . == "TIMED_OUT")) then "FAIL"
+    elif ($s | any(. == "IN_PROGRESS" or . == "PENDING" or . == "QUEUED")) then "PEND"
+    elif ($s | length) == 0 then "NONE"
+    else "PASS" end' <<<"$PR_JSON")
+
+# ── Linear ticket extraction ─────────────────────────────────────────────────
+TICKET=""
+if [[ -n "$BRANCH" && "$BRANCH" =~ ([A-Za-z][A-Za-z]+)-([0-9]+) ]]; then
+  prefix=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')
+  TICKET="${prefix}-${BASH_REMATCH[2]}"
+fi
+LINEAR_URL=""
+[[ -n "$TICKET" && -n "${LINEAR_WORKSPACE:-}" ]] && \
+  LINEAR_URL="https://linear.app/${LINEAR_WORKSPACE}/issue/${TICKET}"
+
+# ── Other PRs this session has created (from transcript, cached) ────────────
+# Uses cc-thread-prs for the creation signal (gh pr create / MCP github create /
+# api.github.com POST). Counts PRs this session created, excluding the current one.
+OTHER_PRS=0
+OTHER_URLS=()
+if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" && -x "$HOME/my/bin/cc-thread-prs" ]]; then
+  if ! cache_fresh "$OTHER_PRS_CACHE" "$OTHER_TTL"; then
+    "$HOME/my/bin/cc-thread-prs" --urls-only --all --transcript "$TRANSCRIPT" 2>/dev/null \
+      > "$OTHER_PRS_CACHE" || : > "$OTHER_PRS_CACHE"
+  fi
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+    OTHER_URLS+=("$u")
+  done < "$OTHER_PRS_CACHE"
+  OTHER_PRS=${#OTHER_URLS[@]}
+fi
+
+# Fetch PR states for each URL in parallel, cached.
+STATES_CACHE="$CACHE_DIR/states.json"
+if (( OTHER_PRS > 0 )) && ! cache_fresh "$STATES_CACHE" "$OTHER_TTL"; then
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cc-states.XXXXXX")
+  for u in "${OTHER_URLS[@]}"; do
+    n=${u##*/}
+    r=${u#https://github.com/}; r=${r%/pull/*}
+    (gh pr view "$n" --repo "$r" --json url,state,isDraft 2>/dev/null > "$tmpdir/${n}.json") &
+  done
+  wait
+  jq -s '[.[] | select(.url)] | map({(.url): {state, isDraft}}) | add // {}' \
+    "$tmpdir"/*.json > "$STATES_CACHE" 2>/dev/null || echo '{}' > "$STATES_CACHE"
+  rm -rf "$tmpdir"
+fi
+
+# url\tstate\tdraft table for fast lookup in pure bash
+PR_STATES_LINES=""
+[[ -s "$STATES_CACHE" ]] && PR_STATES_LINES=$(jq -r 'to_entries[]? | "\(.key)\t\(.value.state // "")\t\(.value.isDraft // false)"' "$STATES_CACHE" 2>/dev/null)
+
+pr_color() { # url -> ANSI color var based on state
+  local url=$1 u s d
+  while IFS=$'\t' read -r u s d; do
+    if [[ "$u" == "$url" ]]; then
+      case "$s" in
+        MERGED) printf '%s' "$FG_MAGENTA" ;;
+        CLOSED) printf '%s' "$FG_RED" ;;
+        OPEN)   [[ "$d" == "true" ]] && printf '%s' "$DIM" || printf '%s' "$FG_GREEN" ;;
+        *)      printf '%s' "$DIM" ;;
+      esac
+      return
+    fi
+  done <<<"$PR_STATES_LINES"
+  printf '%s' "$DIM"
+}
+
+# Build two chip variants: compact (×N) and expanded (#N1 #N2 ...).
+# Skip entirely if the only PR is the current one — it's already in the branch label.
+CHIP_COMPACT=""
+CHIP_EXPANDED=""
+if (( OTHER_PRS > 1 )) || { (( OTHER_PRS == 1 )) && [[ "${OTHER_URLS[0]}" != "$PR_URL" ]]; }; then
+  CHIP_COMPACT="${DIM}${G_PR_OPEN}×${OTHER_PRS}${RESET}"
+  parts=""
+  for u in "${OTHER_URLS[@]}"; do
+    n=${u##*/}
+    c=$(pr_color "$u")
+    parts+=" $(link "$u" "${c}#${n}${RESET}")"
+  done
+  CHIP_EXPANDED="${DIM}${G_PR_OPEN}${RESET}${parts}"
+fi
+
+# ── Assemble LEFT ────────────────────────────────────────────────────────────
+left=""
+if [[ -n "$BRANCH" ]]; then
+  # PR-state icon + branch (+ #num) as hyperlink to PR
+  case "$PR_STATE" in
+    MERGED) icon="${FG_MAGENTA}${G_MERGED}${RESET}" ;;
+    CLOSED) icon="${FG_RED}${G_PR_CLOSED}${RESET}" ;;
+    OPEN)   [[ "$PR_DRAFT" == "true" ]] && icon="${DIM}${G_PR_DRAFT}${RESET}" || icon="${FG_GREEN}${G_PR_OPEN}${RESET}" ;;
+    *)      icon="${DIM}${G_BRANCH}${RESET}" ;;
+  esac
+
+  label="$BRANCH"
+  [[ -n "$PR_NUM" ]] && label+=" #${PR_NUM}"
+  if [[ -n "$PR_URL" ]]; then
+    left="${icon} $(link "$PR_URL" "$label")"
+  else
+    left="${icon} ${label}"
+  fi
+
+  # CI (clickable if we have URL → checks page)
+  CHECKS_URL="${PR_URL:+${PR_URL}/checks}"
+  case "$CI" in
+    PASS) ci="${FG_GREEN}${G_CI_PASS}${RESET}" ;;
+    FAIL) ci="${FG_RED}${G_CI_FAIL}${RESET}" ;;
+    PEND) ci="${FG_YELLOW}${G_CI_PEND}${RESET}" ;;
+    *)    ci="" ;;
+  esac
+  if [[ -n "$ci" ]]; then
+    [[ -n "$CHECKS_URL" ]] && ci=$(link "$CHECKS_URL" "$ci")
+    left+=" $ci"
+  fi
+
+  # Review status
+  case "$PR_REVIEW" in
+    APPROVED)          left+=" ${FG_GREEN}${G_APPROVED}${RESET}" ;;
+    CHANGES_REQUESTED) left+=" ${FG_RED}${G_CHANGES}${RESET}" ;;
+  esac
+
+  # Comments
+  if (( PR_COMMENTS > 0 )); then
+    left+=" ${G_COMMENT}${PR_COMMENTS}"
+  fi
+
+  # Dirty + ahead/behind indicators
+  if (( DIRTY > 0 )); then
+    left+=" ${FG_YELLOW}${G_DIRTY}${DIRTY}${RESET}"
+  fi
+  if (( AHEAD > 0 )); then
+    left+=" ${DIM}${G_AHEAD}${AHEAD}${RESET}"
+  fi
+  if (( BEHIND > 0 )); then
+    left+=" ${FG_YELLOW}${G_BEHIND}${BEHIND}${RESET}"
+  fi
+
+  # Linear ticket (link if workspace set)
+  if [[ -n "$TICKET" ]]; then
+    tlabel="[${TICKET}]"
+    if [[ -n "$LINEAR_URL" ]]; then
+      left+=" ${FG_CYAN}$(link "$LINEAR_URL" "$tlabel")${RESET}"
+    else
+      left+=" ${FG_CYAN}${tlabel}${RESET}"
+    fi
+  fi
+fi
+
+# Append a location label: "org/repo" inside a git repo, or "~/path" otherwise.
+# In a worktree, append "⎇ worktree-name" after the org/repo.
+G_WORKTREE=$'\xee\x95\xbe'   # U+E57E nf-pl-branch (distinct from plain branch glyph)
+loc_disp=""
+origin_url=""
+git rev-parse --git-dir >/dev/null 2>&1 && origin_url=$(git config --get remote.origin.url 2>/dev/null)
+if [[ -n "$origin_url" ]]; then
+  loc_disp=$(printf '%s' "$origin_url" | sed -E 's#\.git$##; s#^.*[:/]([^:/]+/[^/]+)$#\1#')
+  gdir=$(git rev-parse --git-dir 2>/dev/null)
+  cdir=$(git rev-parse --git-common-dir 2>/dev/null)
+  [[ -n "$gdir" && "$gdir" != /* ]] && gdir="$PWD/$gdir"
+  [[ -n "$cdir" && "$cdir" != /* ]] && cdir="$PWD/$cdir"
+  gdir_abs=$(cd "$gdir" 2>/dev/null && pwd)
+  cdir_abs=$(cd "$cdir" 2>/dev/null && pwd)
+  if [[ -n "$gdir_abs" && -n "$cdir_abs" && "$gdir_abs" != "$cdir_abs" ]]; then
+    wt_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
+    [[ -n "$wt_name" ]] && loc_disp="${loc_disp} ${FG_CYAN}${G_WORKTREE}${RESET}${DIM} ${wt_name}${RESET}"
+  fi
+fi
+if [[ -z "$loc_disp" ]]; then
+  pwd_disp="${CWD:-$PWD}"
+  if [[ -n "$HOME" && "$pwd_disp" == "$HOME" ]]; then
+    pwd_disp="~"
+  elif [[ -n "$HOME" && "$pwd_disp" == "$HOME"/* ]]; then
+    pwd_disp="~${pwd_disp#$HOME}"
+  fi
+  loc_disp="$pwd_disp"
+fi
+if [[ -n "$loc_disp" ]]; then
+  left="${DIM}${loc_disp}${RESET}${left:+ }${left}"
+fi
+
+# ── Assemble RIGHT ───────────────────────────────────────────────────────────
+# Progress bar for context window
+bw=10
+filled=$(( CTX_PCT * bw / 100 ))
+(( filled > bw )) && filled=$bw
+(( filled < 0 ))  && filled=0
+empty=$(( bw - filled ))
+bar=""
+(( filled > 0 )) && printf -v fill "%${filled}s" "" && bar="${fill// /▓}"
+(( empty  > 0 )) && printf -v pad  "%${empty}s"  "" && bar+="${pad// /░}"
+
+# Color bar by usage
+if   (( CTX_PCT >= 80 )); then bar="${FG_RED}${bar}${RESET}"
+elif (( CTX_PCT >= 50 )); then bar="${FG_YELLOW}${bar}${RESET}"
+else                            bar="${DIM}${bar}${RESET}"
+fi
+
+# Quota (5-hour / 7-day rate limits; Pro/Max only, may be absent)
+# Pace-aware coloring: compare usage pct against elapsed pct of the window.
+# Dim if you're on pace or ahead; yellow if over pace; red if way over or ≥100%.
+pct_color() { # pct reset_epoch window_seconds -> color var
+  local p=$1 reset=$2 window=$3
+  # Already over quota: always red.
+  (( p >= 100 )) && { printf '%s' "$FG_RED"; return; }
+
+  # Missing time info → fall back to absolute thresholds.
+  if [[ -z "$reset" || -z "$window" ]]; then
+    if   (( p >= 80 )); then printf '%s' "$FG_RED"
+    elif (( p >= 50 )); then printf '%s' "$FG_YELLOW"
+    else                     printf '%s' "$DIM"
+    fi
+    return
+  fi
+
+  local now remaining elapsed elapsed_pct
+  now=$(date +%s)
+  remaining=$(( reset - now ))
+  (( remaining < 0 )) && remaining=0
+  (( remaining > window )) && remaining=$window
+  elapsed=$(( window - remaining ))
+  elapsed_pct=$(( elapsed * 100 / window ))
+
+  # Very early in the window (< 10% elapsed): ratio is too noisy.
+  # Use a loose absolute check — flag only if you're already burning hard.
+  if (( elapsed_pct < 10 )); then
+    if   (( p >= 50 )); then printf '%s' "$FG_RED"
+    elif (( p >= 20 )); then printf '%s' "$FG_YELLOW"
+    else                     printf '%s' "$DIM"
+    fi
+    return
+  fi
+
+  # Pace ratio: usage / elapsed.
+  #   ≤ 100%  → on pace or ahead → dim
+  #   > 100%  → spending faster than time passes → yellow
+  #   > 130%  → projection blows through quota → red
+  if   (( p * 100 > elapsed_pct * 130 )); then printf '%s' "$FG_RED"
+  elif (( p * 100 > elapsed_pct * 100 )); then printf '%s' "$FG_YELLOW"
+  else                                          printf '%s' "$DIM"
+  fi
+}
+
+reset_str() { # epoch -> "3:00p 2h5m" (<24h) / "3d4h" (>=24h) / "soon"
+  local reset=$1 now remaining days hrs mins s dur
+  now=$(date +%s)
+  remaining=$(( reset - now ))
+  (( remaining <= 0 )) && { printf 'soon'; return; }
+  days=$(( remaining / 86400 ))
+  if (( days >= 1 )); then
+    hrs=$(( (remaining % 86400) / 3600 ))
+    if (( hrs > 0 )); then printf '%dd%dh' "$days" "$hrs"
+    else                   printf '%dd'    "$days"
+    fi
+    return
+  fi
+  # <24h: show clock time + duration remaining
+  s=$(date -r "$reset" +'%l:%M%p' 2>/dev/null || date -d "@$reset" +'%l:%M%p' 2>/dev/null)
+  s=${s# }          # strip leading space from %l
+  s=${s//AM/a}
+  s=${s//PM/p}
+  # Round up to the next whole minute
+  remaining=$(( (remaining + 59) / 60 * 60 ))
+  hrs=$(( remaining / 3600 ))
+  mins=$(( (remaining % 3600) / 60 ))
+  if   (( hrs > 0 && mins > 0 )); then dur="${hrs}h${mins}m"
+  elif (( hrs > 0 ));             then dur="${hrs}h"
+  else                                 dur="${mins}m"
+  fi
+  printf '%s %s' "$s" "$dur"
+}
+
+fmt_quota() { # pct reset window label -> "[icon] 45%" (+ "(3:00p 2h5m)" when hot)
+  local p=$1 reset=$2 window=$3 label=$4 c extra=""
+  [[ -z "$p" ]] && return
+  c=$(pct_color "$p" "$reset" "$window")
+  if (( p >= 80 )) && [[ -n "$reset" ]]; then
+    extra=" ($(reset_str "$reset"))"
+  fi
+  printf '%s%s %d%%%s%s' "$c" "$label" "$p" "$extra" "$RESET"
+}
+
+# Window sizes in seconds: 5 hours, 7 days.
+WIN_5H=18000
+WIN_7D=604800
+
+quota_str=""
+q5h=$(fmt_quota "$R5H" "$R5H_RESET" "$WIN_5H" "$G_5H")
+q7d=$(fmt_quota "$R7D" "$R7D_RESET" "$WIN_7D" "$G_7D")
+[[ -n "$q5h" ]] && quota_str+="$q5h"
+[[ -n "$q7d" ]] && quota_str+="${quota_str:+ ${DIM}·${RESET} }$q7d"
+
+# Location icon: SSH > cloud dev env > container > local macOS > generic
+if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+  loc="${FG_YELLOW}${G_SSH}${RESET}"
+elif [[ -n "${CODESPACES:-}${GITPOD_WORKSPACE_ID:-}${CODER_AGENT_TOKEN:-}${CLAUDE_CODE_REMOTE:-}${CLAUDE_REMOTE:-}" ]]; then
+  loc="${FG_CYAN}${G_CLOUD}${RESET}"
+elif [[ -n "${REMOTE_CONTAINERS:-}${DEVCONTAINER:-}${IN_CONTAINER:-}" ]] || [[ -f /.dockerenv ]]; then
+  loc="${FG_CYAN}${G_DOCKER}${RESET}"
+elif [[ "$(uname)" == "Darwin" ]]; then
+  loc="${DIM}${G_APPLE}${RESET}"
+else
+  loc="${DIM}${G_SSH}${RESET}"
+fi
+
+right=""
+
+# Session burn rate: tokens/hour aggregated from the transcript. More useful
+# than $ on Pro/Max where cost is synthetic. Includes input + output + cache
+# creation + cache read — all tokens the model actually processed.
+burn_str=""
+if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] && (( DURATION_MS > 60000 )); then
+  TOKENS_CACHE="$CACHE_DIR/tokens.txt"
+  tm=$(mtime "$TRANSCRIPT")
+  tokens_total=""
+  if [[ -f "$TOKENS_CACHE" ]]; then
+    read -r cm ct < "$TOKENS_CACHE" 2>/dev/null || true
+    [[ "$cm" == "$tm" && -n "$ct" ]] && tokens_total=$ct
+  fi
+  if [[ -z "$tokens_total" ]]; then
+    tokens_total=$(jq -rc '.message.usage? | select(.) |
+      (.input_tokens // 0) + (.output_tokens // 0) +
+      (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)
+    ' "$TRANSCRIPT" 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    printf '%s %s\n' "$tm" "$tokens_total" > "$TOKENS_CACHE"
+  fi
+  if (( tokens_total > 0 )); then
+    rate_per_hr=$(( tokens_total * 3600000 / DURATION_MS ))
+    human=$(awk -v n="$rate_per_hr" 'BEGIN{
+      if (n >= 1000000) printf "%.1fM", n/1000000;
+      else if (n >= 1000) printf "%dk", int(n/1000 + 0.5);
+      else printf "%d", n;
+    }')
+    burn_str="${DIM}Σ${RESET} ${human}${DIM}/hr${RESET}"
+  fi
+fi
+[[ -n "$burn_str" ]] && right+="${burn_str} ${DIM}·${RESET} "
+
+[[ -n "$quota_str" ]] && right+="${quota_str} ${DIM}·${RESET} "
+right+="${DIM}${G_CTX}${RESET} ${bar} ${CTX_PCT}% ${loc} ${DIM}[${RESET}${BOLD}${MODEL}${RESET}"
+if [[ "$FAST_MODE" == "true" ]]; then
+  right+=" ${FG_YELLOW}${G_EFFORT}${RESET}"
+fi
+if [[ -n "$OUTPUT_STYLE" && "$OUTPUT_STYLE" != "default" ]]; then
+  right+=" ${DIM}·${RESET} ${FG_CYAN}${OUTPUT_STYLE}${RESET}"
+fi
+if [[ -n "$EFFORT" ]]; then
+  case "$EFFORT" in
+    high)   ec="$FG_RED" ;;
+    medium) ec="$FG_YELLOW" ;;
+    low)    ec="$FG_GREEN" ;;
+    *)      ec="$DIM" ;;
+  esac
+  right+=" ${DIM}·${RESET} ${ec}${G_EFFORT} ${EFFORT}${RESET}"
+fi
+right+="${DIM}]${RESET}"
+
+# ── Render ───────────────────────────────────────────────────────────────────
+# Prefer the expanded PR chip (#809 #810 …) if the line still fits; otherwise
+# fall back to the compact chip (pr×7).
+rlen=$(vlen "$right")
+gap=2
+if [[ -n "$CHIP_EXPANDED" ]]; then
+  left_ex="${left}${left:+ }${CHIP_EXPANDED}"
+  if (( $(vlen "$left_ex") + rlen + gap <= COLS )); then
+    left="$left_ex"
+  else
+    left="${left}${left:+ }${CHIP_COMPACT}"
+  fi
+fi
+llen=$(vlen "$left")
+total=$(( llen + rlen + gap ))
+
+if [[ -z "$left" ]]; then
+  # Right-only: right-align on a single line. A leading zero-width-ish marker
+  # is required because the harness strips trailing whitespace; without a
+  # character at col 0 the pad collapses and the segment sticks to the left.
+  marker="${DIM}·${RESET}"
+  pad_n=$(( COLS - rlen - 1 ))
+  (( pad_n < 1 )) && pad_n=1
+  printf -v pad_str "%${pad_n}s" ""
+  printf '%s%s%s\n' "$marker" "$pad_str" "$right"
+elif (( total <= COLS )); then
+  # Single line, right-aligned
+  pad_n=$(( COLS - llen - rlen ))
+  (( pad_n < gap )) && pad_n=$gap
+  printf -v pad_str "%${pad_n}s" ""
+  printf '%s%s%s\n' "$left" "$pad_str" "$right"
+else
+  # Overflow: keep right on the right; truncate left to fit on one line.
+  budget=$(( COLS - rlen - gap - 1 ))  # -1 for the ellipsis
+  (( budget < 0 )) && budget=0
+  # Strip ANSI/OSC-8 from left and truncate by visible width. Simple char-based
+  # truncation since embedded hyperlinks/colors make byte truncation unsafe.
+  left_plain=$(strip "$left")
+  left_trunc=$(perl -CSDA -e '
+    my ($s, $max) = @ARGV;
+    my $w = 0; my $out = "";
+    for my $c (split //, $s) {
+      my $cp = ord $c;
+      my $cw = (($cp >= 0xE000 && $cp <= 0xF8FF) || ($cp >= 0xF0000 && $cp <= 0xFFFFD) ||
+                ($cp >= 0x1F300 && $cp <= 0x1FAFF) || ($cp >= 0x2300 && $cp <= 0x23FF) ||
+                ($cp >= 0x2600 && $cp <= 0x27BF) || ($cp >= 0x2E80 && $cp <= 0x9FFF) ||
+                ($cp >= 0xAC00 && $cp <= 0xD7A3) || ($cp >= 0xF900 && $cp <= 0xFAFF) ||
+                ($cp >= 0xFF00 && $cp <= 0xFF60)) ? 2 : 1;
+      last if $w + $cw > $max;
+      $out .= $c; $w += $cw;
+    }
+    print $out;
+  ' -- "$left_plain" "$budget")
+  left_out="${left_trunc}${DIM}…${RESET}"
+  llen2=$(vlen "$left_out")
+  pad_n=$(( COLS - llen2 - rlen ))
+  (( pad_n < gap )) && pad_n=$gap
+  printf -v pad_str "%${pad_n}s" ""
+  printf '%s%s%s\n' "$left_out" "$pad_str" "$right"
+fi
