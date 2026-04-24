@@ -11,7 +11,7 @@
       "name": "claude-stuff",
       "description": "Statusline showing org/repo, branch, PR/CI/review state, context, quota, and model — plus helper scripts (cc-thread-prs, claude-allow).",
       "category": "productivity",
-      "source": ".",
+      "source": "./plugins/claude-stuff",
       "homepage": "https://github.com/NorthIsUp/claude-stuff"
     }
   ]
