@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "statusLine": {
+    "type": "command",
+    "command": "${CLAUDE_PROJECT_DIR}/bin/cc-statusline",
+    "padding": 0,
+    "refreshInterval": 5
+  }
+}

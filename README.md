@@ -12,7 +12,26 @@ Personal Claude Code odds and ends — statusline, helper scripts, hooks.
 
 ## Install
 
-Symlink whatever you want into `$PATH`, then point `~/.claude/settings.json` at the statusline:
+### As a Claude Code plugin
+
+```
+/plugin marketplace add NorthIsUp/claude-stuff
+/plugin install claude-stuff@claude-stuff
+```
+
+### Or in a single project
+
+Clone and use the bundled `.claude/settings.json`:
+
+```bash
+git clone git@github.com:NorthIsUp/claude-stuff.git
+cd claude-stuff
+# settings.json under .claude/ already wires the statusline to ./bin/cc-statusline
+```
+
+### Or globally
+
+Symlink the scripts into `$PATH` and point `~/.claude/settings.json` at the statusline:
 
 ```bash
 ln -s "$PWD/bin/cc-statusline" ~/.local/bin/cc-statusline

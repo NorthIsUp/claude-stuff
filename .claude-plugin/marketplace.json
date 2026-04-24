@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-stuff",
+  "description": "NorthIsUp's Claude Code statusline and helpers",
+  "owner": {
+    "name": "NorthIsUp",
+    "email": "adam@askclara.com"
+  },
+  "plugins": [
+    {
+      "name": "claude-stuff",
+      "description": "Statusline showing org/repo, branch, PR/CI/review state, context, quota, and model — plus helper scripts (cc-thread-prs, claude-allow).",
+      "category": "productivity",
+      "source": ".",
+      "homepage": "https://github.com/NorthIsUp/claude-stuff"
+    }
+  ]
+}
